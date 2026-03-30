@@ -1,11 +1,10 @@
+from flask import Flask, request, send_file
 import io
 import ezdxf
-from flask import Flask, request, send_file
 from ezdxf.enums import TextEntityAlignment
 
 app = Flask(__name__)
 
-# Konfiguracja DIN
 DIN_SIZES = {
     "a4": (297, 210),
     "a3": (420, 297),
@@ -16,89 +15,116 @@ DIN_SIZES = {
 
 MARGIN = {"left": 25, "right": 10, "top": 10, "bottom": 10}
 
-@app.route('/generate', methods=['POST'])
+
+def generate_blank_template(size: str):
+    size = size.lower().strip()
+    if size not in DIN_SIZES:
+        raise ValueError(f"Unknown size '{size}'. Use: {', '.join(DIN_SIZES)}")
+
+    width, height = DIN_SIZES[size]
+
+    doc = ezdxf.new(dxfversion="R2010")
+    doc.header["$INSUNITS"] = 4
+    doc.header["$MEASUREMENT"] = 1
+
+    doc.layers.new("BORDER",      dxfattribs={"color": 7})
+    doc.layers.new("FRAME",       dxfattribs={"color": 7})
+    doc.layers.new("TITLE_BLOCK", dxfattribs={"color": 7})
+    doc.layers.new("TEXT",        dxfattribs={"color": 7})
+
+    msp = doc.modelspace()
+
+    msp.add_lwpolyline(
+        [(0, 0), (width, 0), (width, height), (0, height)],
+        close=True, dxfattribs={"layer": "BORDER", "lineweight": 18},
+    )
+
+    fx = MARGIN["left"]
+    fy = MARGIN["bottom"]
+    fw = width  - MARGIN["left"] - MARGIN["right"]
+    fh = height - MARGIN["top"]  - MARGIN["bottom"]
+
+    msp.add_lwpolyline(
+        [(fx, fy), (fx + fw, fy), (fx + fw, fy + fh), (fx, fy + fh)],
+        close=True, dxfattribs={"layer": "FRAME", "lineweight": 50},
+    )
+
+    tb_height, tb_width = 55, 180
+    tb_x = fx + fw - tb_width
+    tb_y = fy
+
+    msp.add_lwpolyline(
+        [(tb_x, tb_y), (fx + fw, tb_y), (fx + fw, tb_y + tb_height), (tb_x, tb_y + tb_height)],
+        close=True, dxfattribs={"layer": "TITLE_BLOCK", "lineweight": 50},
+    )
+
+    row_heights = [9, 9, 9, 9, 9, 10]
+    y = tb_y
+    row_y = []
+    for rh in row_heights:
+        row_y.append(y)
+        y += rh
+        msp.add_line((tb_x, y), (fx + fw, y), dxfattribs={"layer": "TITLE_BLOCK", "lineweight": 18})
+
+    for co in [60, 120]:
+        msp.add_line((tb_x + co, tb_y), (tb_x + co, tb_y + tb_height),
+                     dxfattribs={"layer": "TITLE_BLOCK", "lineweight": 18})
+
+    def tb_label(text, x, y, h=2.5):
+        msp.add_text(text, dxfattribs={"layer": "TEXT", "height": h}).set_placement(
+            (x, y), align=TextEntityAlignment.BOTTOM_LEFT)
+
+    pad = 1.5
+    c0, c1, c2 = tb_x + pad, tb_x + 60 + pad, tb_x + 120 + pad
+
+    tb_label("TITLE",    c0, row_y[5] + pad)
+    tb_label("DRAWN BY", c0, row_y[4] + pad)
+    tb_label("DATE",     c1, row_y[4] + pad)
+    tb_label("SCALE",    c2, row_y[4] + pad)
+    tb_label("CHECKED",  c0, row_y[3] + pad)
+    tb_label("DATE",     c1, row_y[3] + pad)
+    tb_label("WEIGHT",   c2, row_y[3] + pad)
+    tb_label("APPROVED", c0, row_y[2] + pad)
+    tb_label("DATE",     c1, row_y[2] + pad)
+    tb_label("MATERIAL", c2, row_y[2] + pad)
+    tb_label("DOC. NO.", c0, row_y[1] + pad)
+    tb_label("REVISION", c2, row_y[1] + pad)
+    tb_label("SHEET",    c0, row_y[0] + pad)
+    tb_label("OF",       c1, row_y[0] + pad)
+    tb_label(size.upper(), c2, row_y[0] + pad, h=4.0)
+
+    mark = 5
+    cx, cy = width / 2, height / 2
+    for pos, d in [((cx,0),(0,mark)),((cx,height),(0,-mark)),((0,cy),(mark,0)),((width,cy),(-mark,0))]:
+        msp.add_line(pos, (pos[0]+d[0], pos[1]+d[1]), dxfattribs={"layer": "BORDER", "lineweight": 18})
+
+    # ── Return as in-memory bytes (no disk write needed) ──
+    stream = io.BytesIO()
+    doc.write(stream)
+    stream.seek(0)
+    return stream
+
+
+@app.route("/generate", methods=["POST"])
 def generate():
+    data = request.get_json()
+    size = data.get("size", "a4")
     try:
-        # Pobieranie danych z n8n
-        data = request.get_json()
-        if not data:
-            return {"error": "Missing JSON body"}, 400
-            
-        size = data.get('size', 'a4').lower().strip()
-        
-        if size not in DIN_SIZES:
-            return {"error": f"Size '{size}' not supported. Use a4, a3, etc."}, 400
-
-        width, height = DIN_SIZES[size]
-        
-        # Tworzenie dokumentu DXF
-        doc = ezdxf.new(dxfversion="R2010")
-        doc.header["$INSUNITS"] = 4  # mm
-        doc.header["$MEASUREMENT"] = 1 # metric
-        
-        msp = doc.modelspace()
-
-        # 1. Ramka zewnętrzna (arkusz)
-        msp.add_lwpolyline(
-            [(0, 0), (width, 0), (width, height), (0, height)],
-            close=True, dxfattribs={"lineweight": 18}
-        )
-
-        # 2. Ramka wewnętrzna (pole rysunkowe)
-        fx, fy = MARGIN["left"], MARGIN["bottom"]
-        fw = width - MARGIN["left"] - MARGIN["right"]
-        fh = height - MARGIN["top"] - MARGIN["bottom"]
-        
-        msp.add_lwpolyline(
-            [(fx, fy), (fx + fw, fy), (fx + fw, fy + fh), (fx, fy + fh)],
-            close=True, dxfattribs={"lineweight": 50}
-        )
-
-        # 3. Tabliczka rysunkowa (180x55 mm)
-        tb_w, tb_h = 180, 55
-        tx, ty = fx + fw - tb_w, fy
-        
-        msp.add_lwpolyline(
-            [(tx, ty), (fx + fw, ty), (fx + fw, ty + tb_h), (tx, ty + tb_h)],
-            close=True, dxfattribs={"lineweight": 50}
-        )
-
-        # 4. Proste linie w tabliczce (podział na wiersze)
-        for i in range(1, 6):
-            y_line = ty + (i * 9)
-            msp.add_line((tx, y_line), (fx + fw, y_line))
-
-        # 5. Tekst informacyjny
-        msp.add_text(
-            f"FORMAT: {size.upper()}", 
-            dxfattribs={"height": 5, "layer": "TEXT"}
-        ).set_placement((tx + 5, ty + 40), align=TextEntityAlignment.LEFT)
-        
-        msp.add_text(
-            "GENERATED BY N8N + RENDER", 
-            dxfattribs={"height": 3.5}
-        ).set_placement((tx + 5, ty + 10), align=TextEntityAlignment.LEFT)
-
-        # --- KONWERSJA DO STREAMU ---
-        # Zapisujemy DXF jako tekst do StringIO
-        out_stream = io.StringIO()
-        doc.write(out_stream)
-        
-        # Konwertujemy tekst na bajty dla n8n
-        mem = io.BytesIO()
-        mem.write(out_stream.getvalue().encode('utf-8'))
-        mem.seek(0)
-        out_stream.close()
-
+        stream = generate_blank_template(size)
         return send_file(
-            mem,
+            stream,
             mimetype="application/dxf",
             as_attachment=True,
-            download_name=f"template_{size}.dxf"
+            download_name=f"din_{size.lower()}_template.dxf",
         )
+    except ValueError as e:
+        return {"error": str(e)}, 400
 
-    except Exception as e:
-        return {"error": str(e)}, 500
+
+@app.route("/")
+def health():
+    return {"status": "ok"}
+
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=10000)
+    app.run(host="0.0.0.0", port=5000)
