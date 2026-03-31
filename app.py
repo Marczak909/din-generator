@@ -2,14 +2,12 @@ import io
 import ezdxf
 from flask import Flask, request, send_file
 from ezdxf.enums import TextEntityAlignment
+import os
 
 app = Flask(__name__)
 
-# Rozmiary DIN
-# Konfiguracja DIN
+# Konfiguracja DIN (Usunięto duplikaty)
 DIN_SIZES = {
-    "a4": (297, 210), "a3": (420, 297), "a2": (594, 420),
-    "a1": (841, 594), "a0": (1189, 841)
     "a4": (297, 210),
     "a3": (420, 297),
     "a2": (594, 420),
@@ -22,17 +20,25 @@ MARGIN = {"left": 25, "right": 10, "top": 10, "bottom": 10}
 @app.route('/generate', methods=['POST'])
 def generate():
     try:
-        data = request.json or {}
         # Pobieranie danych z n8n
         data = request.get_json()
         if not data:
             return {"error": "Missing JSON body"}, 400
             
-        size = data.get('size', 'a4').lower().strip()
+        # UWAGA: n8n wysyła dane jako listę (array) [{...}]. 
+        # Wyciągamy pierwszy element z listy, jeśli to lista.
+        if isinstance(data, list):
+            if len(data) == 0:
+                return {"error": "Empty list received from n8n"}, 400
+            data = data[0]
+
+        # W n8n Twój klucz to "Size:" (z dwukropkiem na końcu).
+        # Sprawdzamy różne warianty, żeby było bezpieczniej.
+        raw_size = data.get('Size:') or data.get('Size') or data.get('size') or 'a4'
+        size = str(raw_size).lower().strip()
 
         if size not in DIN_SIZES:
-            return {"error": f"Size {size} not supported"}, 400
-            return {"error": f"Size '{size}' not supported. Use a4, a3, etc."}, 400
+            return {"error": f"Size '{size}' not supported. Use a4, a3, a2, a1, a0."}, 400
 
         width, height = DIN_SIZES[size]
         
@@ -43,19 +49,14 @@ def generate():
         
         msp = doc.modelspace()
 
-        # Rysowanie obramowania zewnętrznego
-        msp.add_lwpolyline([(0, 0), (width, 0), (width, height), (0, height)], close=True)
         # 1. Ramka zewnętrzna (arkusz)
         msp.add_lwpolyline(
             [(0, 0), (width, 0), (width, height), (0, height)],
             close=True, dxfattribs={"lineweight": 18}
         )
 
-        # Rysowanie ramki wewnętrznej
         # 2. Ramka wewnętrzna (pole rysunkowe)
         fx, fy = MARGIN["left"], MARGIN["bottom"]
-        fw, fh = width - MARGIN["left"] - MARGIN["right"], height - MARGIN["top"] - MARGIN["bottom"]
-        msp.add_lwpolyline([(fx, fy), (fx + fw, fy), (fx + fw, fy + fh), (fx, fy + fh)], close=True)
         fw = width - MARGIN["left"] - MARGIN["right"]
         fh = height - MARGIN["top"] - MARGIN["bottom"]
         
@@ -64,12 +65,9 @@ def generate():
             close=True, dxfattribs={"lineweight": 50}
         )
 
-        # Tabliczka rysunkowa (uproszczona dla testu)
         # 3. Tabliczka rysunkowa (180x55 mm)
         tb_w, tb_h = 180, 55
         tx, ty = fx + fw - tb_w, fy
-        msp.add_lwpolyline([(tx, ty), (fx + fw, ty), (fx + fw, ty + tb_h), (tx, ty + tb_h)], close=True)
-        msp.add_text(f"SIZE: {size.upper()}", dxfattribs={"height": 5}).set_placement((tx + 5, ty + 5))
         
         msp.add_lwpolyline(
             [(tx, ty), (fx + fw, ty), (fx + fw, ty + tb_h), (tx, ty + tb_h)],
@@ -81,7 +79,6 @@ def generate():
             y_line = ty + (i * 9)
             msp.add_line((tx, y_line), (fx + fw, y_line))
 
-        # Zapis do strumienia (pamięci RAM)
         # 5. Tekst informacyjny
         msp.add_text(
             f"FORMAT: {size.upper()}", 
@@ -94,16 +91,15 @@ def generate():
         ).set_placement((tx + 5, ty + 10), align=TextEntityAlignment.LEFT)
 
         # --- KONWERSJA DO STREAMU ---
-        # Zapisujemy DXF jako tekst do StringIO
         out_stream = io.StringIO()
         doc.write(out_stream)
 
-        # Konwertujemy tekst na bajty dla n8n
         mem = io.BytesIO()
         mem.write(out_stream.getvalue().encode('utf-8'))
         mem.seek(0)
         out_stream.close()
 
+        # Zwracanie pliku do n8n
         return send_file(
             mem,
             mimetype="application/dxf",
@@ -115,5 +111,6 @@ def generate():
         return {"error": str(e)}, 500
 
 if __name__ == "__main__":
-    app.run()
-    app.run(host='0.0.0.0', port=10000)
+    # Render automatycznie przypisuje port w zmiennej środowiskowej
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
